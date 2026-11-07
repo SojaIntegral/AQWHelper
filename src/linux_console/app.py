@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from http.client import HTTPException
 import logging
 import os
 import re
@@ -46,6 +47,7 @@ from linux_console.class_data import (
     load_class_data,
     resolve_enhancements,
 )
+from linux_console.platform_utils import is_windows
 from linux_console.version_check import current_version, update_available
 from linux_console.release_update import (
     NoPublishedReleaseError,
@@ -600,6 +602,7 @@ class LinuxConsoleApp(App[None]):
         self._character_load_generation = 0
         self._loading_character_generation: int | None = None
         self.restart_requested = False
+        self._restore_target: tuple[str, list[str], set[str]] | None = None
         self.nav_mode = False
         self.nav_pane = "right"
         self._nav_button: NavButton | None = None
@@ -736,6 +739,7 @@ class LinuxConsoleApp(App[None]):
         await super().action_quit()
 
     async def _clear_runtime_cache(self) -> None:
+        self._restore_target = None
         self.account = None
         self._update_character_placeholder()
         self.character_classes.clear()
@@ -855,6 +859,10 @@ class LinuxConsoleApp(App[None]):
         has_leading_slash = token.startswith("/")
         command_prefix = token.lstrip("/")
         command_names = [command.strip() for command, _ in COMMANDS]
+        alias = COMMAND_ALIASES.get(command_prefix.casefold())
+        if alias is not None and alias.startswith(command_prefix.casefold()):
+            # Suggest what Enter will run, e.g. "r" is return, not reload.
+            command_names.insert(0, alias)
         for command in command_names:
             if command.casefold().startswith(command_prefix.casefold()):
                 suggestion = f"/{command}" if has_leading_slash else command
@@ -871,7 +879,7 @@ class LinuxConsoleApp(App[None]):
             and not submitted_value.startswith("/")
         ):
             self._leave_first_run()
-            await self._load_character(submitted_value)
+            self._start_character_load(submitted_value)
             return
 
         command_line = event.value.strip().lstrip("/").strip()
@@ -916,14 +924,14 @@ class LinuxConsoleApp(App[None]):
                 return
             if self._is_first_run():
                 self._leave_first_run()
-            await self._load_character(argument)
+            self._start_character_load(argument)
         elif command == "reload":
             if argument:
                 await self._set_info("Usage: reload", "#f87171")
             elif self.account is None:
                 await self._set_info("Set a character first with char NAME.", "#f87171")
             else:
-                await self._load_character(self.account)
+                self._start_character_load(self.account)
         elif command == "class":
             if argument:
                 await self._show_selected_class(argument)
@@ -964,6 +972,11 @@ class LinuxConsoleApp(App[None]):
                 await self._set_info("Usage: quit", "#f87171")
             else:
                 self.push_screen(QuitConfirm(), self._on_quit_confirmed)
+        else:
+            await self._set_info(
+                f"Unknown command: {parts[0]}. Type return to see the commands.",
+                "#f87171",
+            )
 
     def _is_first_run(self) -> bool:
         return self.query_one("#entry-area", Vertical).has_class("first-run")
@@ -991,6 +1004,28 @@ class LinuxConsoleApp(App[None]):
         account = f" {self.account}" if self.account else ""
         self.query_one("#command-input", Input).placeholder = f"Char:{account}"
 
+    def _start_character_load(self, account: str) -> None:
+        # A worker keeps the UI responsive while the character page loads.
+        self.run_worker(
+            self._load_character(account),
+            name="load-character",
+            group="character-load",
+            exclusive=True,
+        )
+
+    async def _restore_character(
+        self,
+        account: str,
+        classes: list[str],
+        enhancements: set[str],
+    ) -> None:
+        self.account = account
+        self._update_character_placeholder()
+        self.character_classes = classes
+        self.selected_enhancements = enhancements
+        await self._populate_enhancements()
+        await self._populate_class_list(classes)
+
     async def _load_character(
         self,
         account: str,
@@ -999,6 +1034,14 @@ class LinuxConsoleApp(App[None]):
     ) -> None:
         self._character_load_generation += 1
         generation = self._character_load_generation
+        if self.account is not None:
+            # Kept on the app because a cancelled load may already have
+            # cleared the current character.
+            self._restore_target = (
+                self.account,
+                self.character_classes,
+                self.selected_enhancements,
+            )
         self.account = None
         self._update_character_placeholder()
         self.character_classes = []
@@ -1015,23 +1058,31 @@ class LinuxConsoleApp(App[None]):
         self._loading_character_generation = generation
         try:
             classes = await asyncio.to_thread(fetch_classes, account)
-        except (OSError, TimeoutError, ValueError) as error:
+        except (OSError, TimeoutError, ValueError, HTTPException) as error:
             if generation != self._character_load_generation:
                 await self._clear_stale_loading_indicator(generation)
                 return
             await class_list.clear()
             self._loading_character_generation = None
+            if self._restore_target is not None:
+                await self._restore_character(*self._restore_target)
+                await self._set_info(f"Could not load {account}: {error}", "#f87171")
+                return
             if isinstance(error, ValueError):
                 self.listed_classes = []
                 if background_startup:
-                    self.notify(f"Could not load {account}: {error}", severity="error")
+                    self.notify(
+                        f"Could not load {account}: {error}",
+                        severity="error",
+                        markup=False,
+                    )
                 else:
                     await self._set_info(f"Could not load {account}: {error}", "#f87171")
                 return
             await self._populate_class_list(class_data_names())
             message = f"Could not load {account}: {error}. Showing all classes."
             if background_startup:
-                self.notify(message, severity="error")
+                self.notify(message, severity="error", markup=False)
             else:
                 await self._set_info(message, "#f87171")
             return
@@ -1047,6 +1098,8 @@ class LinuxConsoleApp(App[None]):
         except (OSError, ValueError) as error:
             await class_list.clear()
             self._loading_character_generation = None
+            if self._restore_target is not None:
+                await self._restore_character(*self._restore_target)
             await self._set_info(
                 f"Could not load enhancements for {account}: {error}",
                 "#f87171",
@@ -1056,14 +1109,11 @@ class LinuxConsoleApp(App[None]):
         try:
             self.account_history, _ = save_profile(self.settings_path, account)
         except (OSError, ValueError) as error:
-            await class_list.clear()
-            self._loading_character_generation = None
-            message = f"Loaded {account}, but could not save the profile list: {error}"
-            if background_startup:
-                self.notify(message, severity="error")
-            else:
-                await self._set_info(message, "#f87171")
-            return
+            self.notify(
+                f"Loaded {account}, but could not save the profile list: {error}",
+                severity="warning",
+                markup=False,
+            )
 
         self.account = account
         self._update_character_placeholder()
@@ -1157,6 +1207,7 @@ class LinuxConsoleApp(App[None]):
             self.notify(
                 f"Could not save enhancements for {self.account}: {error}",
                 severity="error",
+                markup=False,
             )
 
     async def _populate_enhancements(self) -> None:
@@ -1305,7 +1356,7 @@ class LinuxConsoleApp(App[None]):
         self._set_home_enabled(False)
         await self._clear_info_content()
         await self.query_one("#info-content", VerticalScroll).mount(
-            Static(message, classes="info-detail")
+            Static(message, classes="info-detail", markup=False)
         )
 
     async def _show_commands(self, status: str | None = None) -> None:
@@ -1326,7 +1377,7 @@ class LinuxConsoleApp(App[None]):
             label.append(description, style="#d1d5db")
             await content.mount(Static(label, classes="info-detail"))
         if status:
-            await content.mount(Static(status, classes="info-detail"))
+            await content.mount(Static(status, classes="info-detail", markup=False))
 
     async def _show_saved_characters(self, status: str | None = None) -> None:
         await self._clear_info_content()
@@ -1344,7 +1395,7 @@ class LinuxConsoleApp(App[None]):
             )
         )
         if status:
-            await content.mount(Static(status, classes="info-detail"))
+            await content.mount(Static(status, classes="info-detail", markup=False))
         if not self.account_history:
             await content.mount(
                 Static(
@@ -1370,7 +1421,7 @@ class LinuxConsoleApp(App[None]):
             if index_text.isdecimal():
                 index = int(index_text)
                 if 0 <= index < len(self.account_history):
-                    await self._load_character(self.account_history[index])
+                    self._start_character_load(self.account_history[index])
         elif button_id == "update-yes":
             await self._start_release_update()
         elif button_id == "update-no" or button_id == "update-ok":
@@ -1441,6 +1492,11 @@ class LinuxConsoleApp(App[None]):
 
     async def _install_release_update(self) -> None:
         try:
+            if not await asyncio.to_thread(update_available, 20.0):
+                await self._set_info(
+                    "You already have the latest release.", session="Update"
+                )
+                return
             tag = await asyncio.to_thread(install_latest_release, sys.executable)
         except NoPublishedReleaseError as error:
             await self._set_info(str(error), "#f87171", session="Update")
@@ -1452,9 +1508,17 @@ class LinuxConsoleApp(App[None]):
                 session="Update",
             )
         else:
+            await self._clear_runtime_cache()
+            if is_windows():
+                # pip runs in its own window once this process has exited.
+                logger.info("Release %s is installing in a separate window", tag)
+                self.exit(
+                    message=f"AQW Helper {tag} is installing in a new window. "
+                    "Open the app again when it finishes."
+                )
+                return
             logger.info("Release %s installed; restarting AQW Helper", tag)
             self.restart_requested = True
-            await self._clear_runtime_cache()
             await super().action_quit()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -1949,3 +2013,7 @@ def main() -> None:
             sys.executable,
             [sys.executable, "-m", "linux_console", *sys.argv[1:]],
         )
+
+
+if __name__ == "__main__":
+    main()
